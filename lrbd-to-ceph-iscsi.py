@@ -6,25 +6,26 @@ import os
 import pprint
 import rados
 
-# TODO switch to rtslib_fb
-from rtslib.root import RTSRoot
+from rtslib_fb.root import RTSRoot
 
 
 class LrbdConfig():
 
     def __init__(self):
+        # TODO - read lrbd.conf from rados
         f = open('/var/cache/salt/minion/files/base/ceph/igw/cache/lrbd.conf', 'r')
         self.config = json.loads(f.read())
 
     def get_portal_name(self, ip):
         for portal in self.config['portals']:
             if ip in portal['addresses']:
-                return str(portal['name'])
+                return str(portal['name'])  # TODO - use host
         raise Exception("IP address '{}' not found in lrbd.conf".format(ip))
 
 
 class CephIscsiConfig():
 
+    # TODO - check if these defaults values are correct
     controls_defaults = {
         "block_size": 512,
         "emulate_3pc": 1,
@@ -68,7 +69,7 @@ class CephIscsiConfig():
             "targets": {},
             "discovery_auth": {'chap': '',
                                'chap_mutual': ''},
-            "version": 4,
+            "version": 5,  # TODO - check if it's 4 or 5
             "epoch": 0,
             "created": now,
             "updated": now
@@ -93,14 +94,12 @@ class CephIscsiConfig():
 
     @staticmethod
     def _get_pool_id(pool):
-        # TODO - get pool id from ceph
-        #with rados.Rados(conffile='/etc/ceph/ceph.conf') as cluster:
-        #    pool_id = cluster.pool_lookup(pool)
-        #return pool_id
-        return 1
+        with rados.Rados(conffile='/etc/ceph/ceph.conf') as cluster:
+            pool_id = cluster.pool_lookup(pool)
+        return pool_id
 
     def _get_controls(self, pool, image):
-        disk_id = '{}.{}'.format(pool, image)
+        disk_id = '{}-{}'.format(pool, image)
         glob_path = "{}/{}/{}".format('/sys/kernel/config/target',
                                       'core',
                                       'rbd_*/{}/attrib'.format(disk_id))
@@ -111,14 +110,23 @@ class CephIscsiConfig():
         for base in paths:
             for attr in os.listdir(base):
                 path = base + "/" + attr
-                if os.access(path, os.R_OK) and os.access(path, os.W_OK):
+                has_access = True
+                try:
+                    f = open(path, 'r')
+                    f.close()
+                    f = open(path, 'w')
+                    f.close()
+                except IOError:
+                    has_access = False
+                if has_access:
                     if attr not in self.controls_defaults:
                         self.errors.append('(Unknown attr) - Unknown default value for attr {}'.format(attr))
                     content = open(path).read().rstrip('\n')
                     if attr in controls_overrides and controls_overrides[attr] != content:
                         self.errors.append('(Each attr must have the same value for all disks in the targets) - '
-                                           'Check attr {} on {}'.format(attr, path))
+                                       'Check attr {} on {}'.format(attr, path))
                     if attr not in self.controls_defaults or str(self.controls_defaults[attr]) != content:
+                        # TODO - convert content to int
                         controls_overrides[attr] = content
         return controls_overrides
 
@@ -169,6 +177,7 @@ class CephIscsiConfig():
         owner = self._get_owner(target_iqn)
         self.config['disks'][disk_id] = {
             'controls': self._get_controls(pool, image),
+            'backstore': 'rbd',
             'created': now,
             'image': image,
             'owner': owner,
@@ -223,7 +232,7 @@ class CephIscsiConfig():
                 errors_str += '\n    - {}'.format(error)
             raise Exception('ceph-iscsi config not persisted. Check the following errors:{}'.format(errors_str))
         else:
-            # TODO - save config into rados
+            # TODO - save config into rados (json dump)
             pass
 
 
@@ -256,10 +265,10 @@ def main(logger):
                 ceph_iscsi_config.add_disk(target.wwn, pool, image, lun.storage_object.wwn)
             for node_acl in tpg.node_acls:
                 ceph_iscsi_config.add_client(target.wwn, node_acl.node_wwn)
-                userid = node_acl.get_auth_attr('userid')
-                password = node_acl.get_auth_attr('password')
-                userid_mutual = node_acl.get_auth_attr('userid_mutual')
-                password_mutual = node_acl.get_auth_attr('password_mutual')
+                userid = node_acl.chap_userid
+                password = node_acl.chap_password
+                userid_mutual = node_acl.chap_mutual_userid
+                password_mutual = node_acl.chap_mutual_password
                 # TODO - check if auth is enabled
                 # TODO - no auth
                 ceph_iscsi_config.add_client_auth(target.wwn, node_acl.node_wwn, userid, password, userid_mutual, password_mutual)
