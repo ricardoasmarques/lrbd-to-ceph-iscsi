@@ -121,10 +121,10 @@ class CephIscsiConfig():
         return pool_id
 
     def _get_controls(self, pool, image):
-        disk_id = '{}-{}'.format(pool, image)
+        backstore_object_name = '{}-{}'.format(pool, image)
         glob_path = "{}/{}/{}".format('/sys/kernel/config/target',
                                       'core',
-                                      'rbd_*/{}/attrib'.format(disk_id))
+                                      'rbd_*/{}/attrib'.format(backstore_object_name))
         paths = glob.glob(glob_path)
         if not paths:
             self.errors.append('(Disk attribs not found) - Cannot find attribs at {}'.format(glob_path))
@@ -200,6 +200,7 @@ class CephIscsiConfig():
         self.config['disks'][disk_id] = {
             'controls': self._get_controls(pool, image),
             'backstore': 'rbd',
+            'backstore_object_name': '{}-{}'.format(pool, image),
             'created': now,
             'image': image,
             'owner': owner,
