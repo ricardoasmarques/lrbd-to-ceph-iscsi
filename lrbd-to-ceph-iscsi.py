@@ -2,25 +2,40 @@ import datetime
 import glob
 import json
 import logging
+import netifaces
 import os
 import pprint
 import rados
+import socket
 
 from rtslib_fb.root import RTSRoot
 
 
-class LrbdConfig():
+class CephCluster():
+
+    pool_name = 'rbd' # TODO - which pool is used by lrbd?
+    config_name = 'gateway.conf'
 
     def __init__(self):
-        # TODO - read lrbd.conf from rados
-        f = open('/var/cache/salt/minion/files/base/ceph/igw/cache/lrbd.conf', 'r')
-        self.config = json.loads(f.read())
+        self.cluster = rados.Rados(conffile='/etc/ceph/ceph.conf',
+                                   conf=dict(keyring='/etc/ceph/ceph.client.admin.keyring'))
+        self.cluster.connect()
 
-    def get_portal_name(self, ip):
-        for portal in self.config['portals']:
-            if ip in portal['addresses']:
-                return str(portal['name'])  # TODO - use host
-        raise Exception("IP address '{}' not found in lrbd.conf".format(ip))
+    def read_config(self):
+        ioctx = self.cluster.open_ioctx(self.pool_name)
+
+        size, mtime = ioctx.stat(self.config_name)
+        cfg_str = ioctx.read(self.config_name, length=size)
+        ioctx.close()
+        return json.loads(cfg_str)
+
+    # TODO def lock
+
+    def write_config(self, config):
+        ioctx = self.cluster.open_ioctx(self.pool_name)
+        ioctx.write_full(self.config_name, config.encode('utf-8'))
+        ioctx.close()
+        # TODO unlock
 
 
 class CephIscsiConfig():
@@ -62,18 +77,24 @@ class CephIscsiConfig():
         self.logger = logger
         self.pprinter = pprint.PrettyPrinter()
         # TODO read from ceph, if exists
-        now = CephIscsiConfig._get_time()
-        self.config = {
-            "disks": {},
-            "gateways": {},
-            "targets": {},
-            "discovery_auth": {'chap': '',
-                               'chap_mutual': ''},
-            "version": 5,  # TODO - check if it's 4 or 5
-            "epoch": 0,
-            "created": now,
-            "updated": now
-        }
+        self.cluster = CephCluster()
+        try:
+            self.config = self.cluster.read_config()
+            config_pretty = self.pprinter.pformat(self.config)
+            self.logger.info('Reading config:\n%s', config_pretty)
+        except rados.ObjectNotFound:
+            now = CephIscsiConfig._get_time()
+            self.config = {
+                "disks": {},
+                "gateways": {},
+                "targets": {},
+                "discovery_auth": {'chap': '',
+                                   'chap_mutual': ''},
+                "version": 5,  # TODO - check if it's 4 or 5
+                "epoch": 0,
+                "created": now,
+                "updated": now
+            }
 
     @staticmethod
     def _get_time():
@@ -83,14 +104,15 @@ class CephIscsiConfig():
     def add_target(self, target_iqn):
         self.logger.debug('Adding target %s', target_iqn)
         now = CephIscsiConfig._get_time()
-        self.config['targets'][target_iqn] = {
-            'created': now,
-            'disks': [],
-            'clients': {},
-            'portals': {},
-            'groups': {},
-            'controls': {}
-         }
+        if target_iqn not in self.config['targets']:
+            self.config['targets'][target_iqn] = {
+                'created': now,
+                'disks': [],
+                'clients': {},
+                'portals': {},
+                'groups': {},
+                'controls': {}
+             }
 
     @staticmethod
     def _get_pool_id(pool):
@@ -124,7 +146,7 @@ class CephIscsiConfig():
                     content = open(path).read().rstrip('\n')
                     if attr in controls_overrides and controls_overrides[attr] != content:
                         self.errors.append('(Each attr must have the same value for all disks in the targets) - '
-                                       'Check attr {} on {}'.format(attr, path))
+                                           'Check attr {} on {}'.format(attr, path))
                     if attr not in self.controls_defaults or str(self.controls_defaults[attr]) != content:
                         # TODO - convert content to int
                         controls_overrides[attr] = content
@@ -150,7 +172,7 @@ class CephIscsiConfig():
                 'tpgs': 0
             }
         target_config['ip_list'].append(ip)
-        for portal_name, portal_config in target_config['portals'].items():
+        for _, portal_config in target_config['portals'].items():
             portal_config['gateway_ip_list'] = target_config['ip_list']
             inactive_portal_ips = list(portal_config['gateway_ip_list'])
             inactive_portal_ips.remove(portal_config['portal_ip_address'])
@@ -223,9 +245,15 @@ class CephIscsiConfig():
         if userid_mutual and password_mutual:
             self.config['discovery_auth']['chap_mutual'] = '{}/{}'.format(userid_mutual, password_mutual)
 
+    def get_tpgs(self, target_iqn):
+        target_config = self.config['targets'][target_iqn]
+        if 'ip_list' in target_config:
+            return len(target_config['ip_list'])
+        return 0
+
     def persist_config(self):
-        pprint = self.pprinter.pformat(self.config)
-        self.logger.info('Generated config:\n%s', pprint)
+        config_pretty = self.pprinter.pformat(self.config)
+        self.logger.info('Writing config:\n%s', config_pretty)
         if self.errors:
             errors_str = ''
             for error in self.errors:
@@ -233,13 +261,35 @@ class CephIscsiConfig():
             raise Exception('ceph-iscsi config not persisted. Check the following errors:{}'.format(errors_str))
         else:
             # TODO - save config into rados (json dump)
-            pass
+            self.cluster.write_config(json.dumps(self.config))
 
+
+def _ip_addresses():
+    ip_list = set()
+    for iface in netifaces.interfaces():
+        if netifaces.AF_INET in netifaces.ifaddresses(iface):
+            for link in netifaces.ifaddresses(iface)[netifaces.AF_INET]:
+                ip_list.add(link['addr'])
+        if netifaces.AF_INET6 in netifaces.ifaddresses(iface):
+            for link in netifaces.ifaddresses(iface)[netifaces.AF_INET6]:
+                if '%' in link['addr']:
+                    continue#
+                ip_list.add(link['addr'])
+
+    ip_list.discard('::1')
+    ip_list.discard('127.0.0.1')
+
+    return list(ip_list)
+
+
+def _get_portal_name(ip):
+    if ip in _ip_addresses():
+        return socket.gethostname().split('.')[0]
+    return None
 
 def main(logger):
     lio_root = RTSRoot()
     ceph_iscsi_config = CephIscsiConfig(logger)
-    lrbd_config = LrbdConfig()
     discovery_auth_path = '{}/{}/{}'.format('/sys/kernel/config/target',
                                             'iscsi',
                                             'discovery_auth')
@@ -254,28 +304,31 @@ def main(logger):
         for tpg in target.tpgs:
             logger.info('Processing tpg - %s', tpg)
             for network_portal in tpg.network_portals:
-                portal_name = lrbd_config.get_portal_name(network_portal.ip_address)
-                ceph_iscsi_config.add_portal(target.wwn, portal_name, network_portal.ip_address)
-            disks_by_lun = {}
-            for lun in tpg.luns:
-                udev_path_list = lun.storage_object.udev_path.split('/')
-                pool = udev_path_list[len(udev_path_list) - 2]
-                image = udev_path_list[len(udev_path_list) - 1]
-                disks_by_lun[lun.lun] = (pool, image)
-                ceph_iscsi_config.add_disk(target.wwn, pool, image, lun.storage_object.wwn)
-            for node_acl in tpg.node_acls:
-                ceph_iscsi_config.add_client(target.wwn, node_acl.node_wwn)
-                userid = node_acl.chap_userid
-                password = node_acl.chap_password
-                userid_mutual = node_acl.chap_mutual_userid
-                password_mutual = node_acl.chap_mutual_password
-                # TODO - check if auth is enabled
-                # TODO - no auth
-                ceph_iscsi_config.add_client_auth(target.wwn, node_acl.node_wwn, userid, password, userid_mutual, password_mutual)
-                for mapped_lun in node_acl.mapped_luns:
-                    disk = disks_by_lun[mapped_lun.mapped_lun]
-                    ceph_iscsi_config.add_client_lun(target.wwn, node_acl.node_wwn, disk[0], disk[1], mapped_lun.mapped_lun)
+                portal_name = _get_portal_name(network_portal.ip_address)
+                if portal_name:
+                    ceph_iscsi_config.add_portal(target.wwn, portal_name, network_portal.ip_address)
+            if len(list(target.tpgs)) == ceph_iscsi_config.get_tpgs(target.wwn):
+                disks_by_lun = {}
+                for lun in tpg.luns:
+                    udev_path_list = lun.storage_object.udev_path.split('/')
+                    pool = udev_path_list[len(udev_path_list) - 2]
+                    image = udev_path_list[len(udev_path_list) - 1]
+                    disks_by_lun[lun.lun] = (pool, image)
+                    ceph_iscsi_config.add_disk(target.wwn, pool, image, lun.storage_object.wwn)
+                for node_acl in tpg.node_acls:
+                    ceph_iscsi_config.add_client(target.wwn, node_acl.node_wwn)
+                    userid = node_acl.chap_userid
+                    password = node_acl.chap_password
+                    userid_mutual = node_acl.chap_mutual_userid
+                    password_mutual = node_acl.chap_mutual_password
+                    # TODO - check if auth is enabled
+                    # TODO - no auth
+                    ceph_iscsi_config.add_client_auth(target.wwn, node_acl.node_wwn, userid, password, userid_mutual, password_mutual)
+                    for mapped_lun in node_acl.mapped_luns:
+                        disk = disks_by_lun[mapped_lun.mapped_lun]
+                        ceph_iscsi_config.add_client_lun(target.wwn, node_acl.node_wwn, disk[0], disk[1], mapped_lun.mapped_lun)
     ceph_iscsi_config.persist_config()
+
 
 if __name__ == "__main__":
     logger = logging.getLogger('lrbd-to-ceph-iscsi')
