@@ -311,7 +311,7 @@ def main(logger):
             if len(list(target.tpgs)) == ceph_iscsi_config.get_tpgs(target.wwn):
                 disks_by_lun = {}
                 for lun in tpg.luns:
-                    udev_path_list = lun.storage_object.udev_path.split('/')
+                    udev_path_list = lun.storage_object.udev_path.split('/') # TODO - will this work if pool or image has a '/' in the name?
                     pool = udev_path_list[len(udev_path_list) - 2]
                     image = udev_path_list[len(udev_path_list) - 1]
                     disks_by_lun[lun.lun] = (pool, image)
