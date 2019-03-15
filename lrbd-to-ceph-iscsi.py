@@ -3,7 +3,6 @@ import glob
 import json
 import logging
 import netifaces
-import os
 import pprint
 import rados
 import socket
@@ -29,18 +28,14 @@ class CephCluster():
         ioctx.close()
         return json.loads(cfg_str)
 
-    # TODO def lock
-
     def write_config(self, config):
         ioctx = self.cluster.open_ioctx(self.pool_name)
         ioctx.write_full(self.config_name, config.encode('utf-8'))
         ioctx.close()
-        # TODO unlock
 
 
 class CephIscsiConfig():
 
-    # TODO - check if these defaults values are correct
     controls_defaults = {
         "block_size": 512,
         "emulate_3pc": 1,
@@ -71,12 +66,20 @@ class CephIscsiConfig():
         "unmap_zeroes_data": 8192
     }
 
+    target_controls_defaults = {
+        "default_cmdsn_depth": 64,
+        "default_erl": 0,
+        "login_timeout": 15,
+        "netif_timeout": 2,
+        "prod_mode_write_protect": 0,
+        "t10_pi": 0
+    }
+
     errors = []
 
     def __init__(self, logger):
         self.logger = logger
         self.pprinter = pprint.PrettyPrinter()
-        # TODO read from ceph, if exists
         self.cluster = CephCluster()
         try:
             self.config = self.cluster.read_config()
@@ -88,9 +91,13 @@ class CephIscsiConfig():
                 "disks": {},
                 "gateways": {},
                 "targets": {},
-                "discovery_auth": {'chap': '',
-                                   'chap_mutual': ''},
-                "version": 5,  # TODO - check if it's 4 or 5
+                "discovery_auth": {'username': '',
+                                   'password': '',
+                                   'password_encryption_enabled': False,
+                                   'mutual_username': '',
+                                   'mutual_password': '',
+                                   'mutual_password_encryption_enabled': False},
+                "version": 8,
                 "epoch": 0,
                 "created": now,
                 "updated": now
@@ -101,17 +108,18 @@ class CephIscsiConfig():
         utc = datetime.datetime.utcnow()
         return utc.strftime('%Y/%m/%d %H:%M:%S')
 
-    def add_target(self, target_iqn):
-        self.logger.debug('Adding target %s', target_iqn)
+    def add_target(self, target_iqn, acl_enabled, target_controls):
+        self.logger.debug('Adding target %s / %s', target_iqn, acl_enabled)
         now = CephIscsiConfig._get_time()
         if target_iqn not in self.config['targets']:
             self.config['targets'][target_iqn] = {
                 'created': now,
                 'disks': [],
+                'acl_enabled': acl_enabled,
                 'clients': {},
                 'portals': {},
                 'groups': {},
-                'controls': {}
+                'controls': target_controls
              }
 
     @staticmethod
@@ -130,26 +138,40 @@ class CephIscsiConfig():
             self.errors.append('(Disk attribs not found) - Cannot find attribs at {}'.format(glob_path))
         controls_overrides = {}
         for base in paths:
-            for attr in os.listdir(base):
+            for attr in self.controls_defaults:
                 path = base + "/" + attr
-                has_access = True
-                try:
-                    f = open(path, 'r')
-                    f.close()
-                    f = open(path, 'w')
-                    f.close()
-                except IOError:
-                    has_access = False
-                if has_access:
-                    if attr not in self.controls_defaults:
-                        self.errors.append('(Unknown attr) - Unknown default value for attr {}'.format(attr))
-                    content = open(path).read().rstrip('\n')
-                    if attr in controls_overrides and controls_overrides[attr] != content:
-                        self.errors.append('(Each attr must have the same value for all disks in the targets) - '
-                                           'Check attr {} on {}'.format(attr, path))
-                    if attr not in self.controls_defaults or str(self.controls_defaults[attr]) != content:
-                        # TODO - convert content to int
-                        controls_overrides[attr] = content
+                content = open(path).read().rstrip('\n')
+                if attr in controls_overrides and controls_overrides[attr] != content:
+                    self.errors.append(
+                        '(Each attr must have the same value for all disks in the targets) - '
+                        'Check attr {} on {}'.format(attr, path))
+                if str(self.controls_defaults[attr]) != content:
+                    if isinstance(content, int):
+                        content = int(content)
+                    controls_overrides[attr] = content
+        return controls_overrides
+
+    def _get_target_controls(self, target_iqn):
+        glob_path = "{}/{}/{}".format('/sys/kernel/config/target',
+                                      'iscsi',
+                                      '{}/tpgt_*/attrib'.format(target_iqn))
+        paths = glob.glob(glob_path)
+        if not paths:
+            self.errors.append('(Target attribs not found) - Cannot find attribs at '
+                               '{}'.format(glob_path))
+        controls_overrides = {}
+        for base in paths:
+            for attr in self.target_controls_defaults:
+                path = base + "/" + attr
+                content = open(path).read().rstrip('\n')
+                if attr in controls_overrides and controls_overrides[attr] != content:
+                    self.errors.append(
+                        '(Each attr must have the same value for all tpgs in the target) - '
+                        'Check attr {} on {}'.format(attr, path))
+                if str(self.target_controls_defaults[attr]) != content:
+                    if isinstance(content, int):
+                        content = int(content)
+                    controls_overrides[attr] = content
         return controls_overrides
 
     def add_portal(self, target_iqn, portal_name, ip):
@@ -191,7 +213,7 @@ class CephIscsiConfig():
     def add_disk(self, target_iqn, pool, image, wwn):
         self.logger.debug('Adding disk %s / %s / %s / %s', target_iqn, pool, image, wwn)
         now = CephIscsiConfig._get_time()
-        disk_id = '{}.{}'.format(pool, image)
+        disk_id = '{}/{}'.format(pool, image)
         if disk_id in self.config['disks']:
             if disk_id not in self.config['targets'][target_iqn]['disks']:
                 raise Exception("Disk {} cannot be exported by multiple targets".format(disk_id))
@@ -216,8 +238,12 @@ class CephIscsiConfig():
         target_config = self.config['targets'][target_iqn]
         target_config['clients'][client_iqn] = {
             'auth': {
-                'chap': '',
-                'chap_mutual': ''
+                'username': '',
+                'password': '',
+                'password_encryption_enabled': False,
+                'mutual_username': '',
+                'mutual_password': '',
+                'mutual_password_encryption_enabled': False
             },
             'luns': {},
             'group_name': ''
@@ -227,14 +253,16 @@ class CephIscsiConfig():
         self.logger.debug('Adding client lun %s / %s / %s / %s / %s / %s', target_iqn, client_iqn, userid, password, userid_mutual, password_mutual)
         client_config = self.config['targets'][target_iqn]['clients'][client_iqn]
         if userid and password:
-            client_config['auth']['chap'] = '{}/{}'.format(userid, password)
+            client_config['auth']['username'] = userid
+            client_config['auth']['password'] = password
         if userid_mutual and password_mutual:
-            client_config['auth']['chap_mutual'] = '{}/{}'.format(userid_mutual, password_mutual)
+            client_config['auth']['mutual_username'] = userid_mutual
+            client_config['auth']['mutual_password'] = password_mutual
 
     def add_client_lun(self, target_iqn, client_iqn, pool, image, lun_id):
         self.logger.debug('Adding client lun %s / %s / %s / %s / %s', target_iqn, client_iqn, pool, image, lun_id)
         client_config = self.config['targets'][target_iqn]['clients'][client_iqn]
-        disk_id = '{}.{}'.format(pool, image)
+        disk_id = '{}/{}'.format(pool, image)
         client_config['luns'][disk_id] = {
             'lun_id': lun_id
         }
@@ -242,9 +270,11 @@ class CephIscsiConfig():
     def add_discovery_auth(self, userid, password, userid_mutual, password_mutual):
         self.logger.debug('Adding discovery auth %s / %s / %s / %s', userid, password, userid_mutual, password_mutual)
         if userid and password:
-            self.config['discovery_auth']['chap'] = '{}/{}'.format(userid, password)
+            self.config['discovery_auth']['username'] = userid
+            self.config['discovery_auth']['password'] = password
         if userid_mutual and password_mutual:
-            self.config['discovery_auth']['chap_mutual'] = '{}/{}'.format(userid_mutual, password_mutual)
+            self.config['discovery_auth']['mutual_username'] = userid_mutual
+            self.config['discovery_auth']['mutual_password'] = password_mutual
 
     def get_tpgs(self, target_iqn):
         target_config = self.config['targets'][target_iqn]
@@ -261,7 +291,6 @@ class CephIscsiConfig():
                 errors_str += '\n    - {}'.format(error)
             raise Exception('ceph-iscsi config not persisted. Check the following errors:{}'.format(errors_str))
         else:
-            # TODO - save config into rados (json dump)
             self.cluster.write_config(json.dumps(self.config))
 
 
@@ -288,7 +317,15 @@ def _get_portal_name(ip):
         return socket.gethostname().split('.')[0]
     return None
 
+
+def _is_acl_enabled(target):
+    for tpg in target.tpgs:
+        if tpg.get_attribute('generate_node_acls') == 0:
+            return True
+    return False
+
 def main(logger):
+    # TODO Validations before convertion: - One RBD image cannot be exported by more than one target
     lio_root = RTSRoot()
     ceph_iscsi_config = CephIscsiConfig(logger)
     discovery_auth_path = '{}/{}/{}'.format('/sys/kernel/config/target',
@@ -300,8 +337,9 @@ def main(logger):
     password_mutual = open(discovery_auth_path + "/password_mutual").read().rstrip('\n')
     ceph_iscsi_config.add_discovery_auth(userid, password, userid_mutual, password_mutual)
     for target in lio_root.targets:
-        ceph_iscsi_config.add_target(target.wwn)
-        # TODO - target controls
+        acl_enabled = _is_acl_enabled(target)
+        target_controls = ceph_iscsi_config._get_target_controls(target.wwn)
+        ceph_iscsi_config.add_target(target.wwn, acl_enabled, target_controls)
         for tpg in target.tpgs:
             logger.info('Processing tpg - %s', tpg)
             for network_portal in tpg.network_portals:
@@ -311,7 +349,7 @@ def main(logger):
             if len(list(target.tpgs)) == ceph_iscsi_config.get_tpgs(target.wwn):
                 disks_by_lun = {}
                 for lun in tpg.luns:
-                    udev_path_list = lun.storage_object.udev_path.split('/') # TODO - will this work if pool or image has a '/' in the name?
+                    udev_path_list = lun.storage_object.udev_path.split('/')
                     pool = udev_path_list[len(udev_path_list) - 2]
                     image = udev_path_list[len(udev_path_list) - 1]
                     disks_by_lun[lun.lun] = (pool, image)
@@ -323,7 +361,6 @@ def main(logger):
                     userid_mutual = node_acl.chap_mutual_userid
                     password_mutual = node_acl.chap_mutual_password
                     # TODO - check if auth is enabled
-                    # TODO - no auth
                     ceph_iscsi_config.add_client_auth(target.wwn, node_acl.node_wwn, userid, password, userid_mutual, password_mutual)
                     for mapped_lun in node_acl.mapped_luns:
                         disk = disks_by_lun[mapped_lun.mapped_lun]
