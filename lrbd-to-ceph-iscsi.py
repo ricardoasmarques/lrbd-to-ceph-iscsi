@@ -6,16 +6,17 @@ import netifaces
 import pprint
 import rados
 import socket
+import sys
 
 from rtslib_fb.root import RTSRoot
 
 
 class CephCluster():
 
-    pool_name = 'rbd' # TODO - which pool is used by lrbd?
     config_name = 'gateway.conf'
 
-    def __init__(self):
+    def __init__(self, pool_name):
+        self.pool_name = pool_name
         self.cluster = rados.Rados(conffile='/etc/ceph/ceph.conf',
                                    conf=dict(keyring='/etc/ceph/ceph.client.admin.keyring'))
         self.cluster.connect()
@@ -77,10 +78,10 @@ class CephIscsiConfig():
 
     errors = []
 
-    def __init__(self, logger):
+    def __init__(self, logger, pool_name):
         self.logger = logger
         self.pprinter = pprint.PrettyPrinter()
-        self.cluster = CephCluster()
+        self.cluster = CephCluster(pool_name)
         try:
             self.config = self.cluster.read_config()
             config_pretty = self.pprinter.pformat(self.config)
@@ -193,7 +194,8 @@ class CephIscsiConfig():
                 'portal_ip_address': ip,
                 'tpgs': 0
             }
-        target_config['ip_list'].append(ip)
+        if ip not in target_config['ip_list']:
+            target_config['ip_list'].append(ip)
         for _, portal_config in target_config['portals'].items():
             portal_config['gateway_ip_list'] = target_config['ip_list']
             inactive_portal_ips = list(portal_config['gateway_ip_list'])
@@ -324,10 +326,28 @@ def _is_acl_enabled(target):
             return True
     return False
 
-def main(logger):
-    # TODO Validations before convertion: - One RBD image cannot be exported by more than one target
+def validate(lio_root):
+    targets_by_disk = {}
+    for target in lio_root.targets:
+        for tpg in target.tpgs:
+            for lun in tpg.luns:
+                udev_path_list = lun.storage_object.udev_path.split('/')
+                pool = udev_path_list[len(udev_path_list) - 2]
+                image = udev_path_list[len(udev_path_list) - 1]
+                disk_id = '{}/{}'.format(pool, image)
+                if disk_id not in targets_by_disk:
+                    targets_by_disk[disk_id] = []
+                if target.wwn not in targets_by_disk[disk_id]:
+                    targets_by_disk[disk_id].append(target.wwn)
+                if len(targets_by_disk[disk_id]) > 1:
+                    raise Exception(
+                        'Unsupported LIO configuration: Disk {} belongs to more than one '
+                        'target ({})'.format(disk_id, targets_by_disk[disk_id]))
+
+def main(logger, pool_name):
     lio_root = RTSRoot()
-    ceph_iscsi_config = CephIscsiConfig(logger)
+    validate(lio_root)
+    ceph_iscsi_config = CephIscsiConfig(logger, pool_name)
     discovery_auth_path = '{}/{}/{}'.format('/sys/kernel/config/target',
                                             'iscsi',
                                             'discovery_auth')
@@ -360,7 +380,6 @@ def main(logger):
                     password = node_acl.chap_password
                     userid_mutual = node_acl.chap_mutual_userid
                     password_mutual = node_acl.chap_mutual_password
-                    # TODO - check if auth is enabled
                     ceph_iscsi_config.add_client_auth(target.wwn, node_acl.node_wwn, userid, password, userid_mutual, password_mutual)
                     for mapped_lun in node_acl.mapped_luns:
                         disk = disks_by_lun[mapped_lun.mapped_lun]
@@ -375,5 +394,8 @@ if __name__ == "__main__":
     file_format = logging.Formatter("%(asctime)s [%(levelname)8s] - %(message)s")
     file_handler.setFormatter(file_format)
     logger.addHandler(file_handler)
-    main(logger)
+    if len(sys.argv) < 2:
+        raise Exception('Usage: lrbd-to-ceph-iscsi <pool_name>')
+    pool_name = sys.argv[1]
+    main(logger, pool_name)
 
