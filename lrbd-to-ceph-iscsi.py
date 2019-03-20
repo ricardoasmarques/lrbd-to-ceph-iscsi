@@ -29,9 +29,10 @@ class CephCluster():
         ioctx.close()
         return json.loads(cfg_str)
 
-    def write_config(self, config):
+    def write_config(self, config, epoch):
         ioctx = self.cluster.open_ioctx(self.pool_name)
         ioctx.write_full(self.config_name, config.encode('utf-8'))
+        ioctx.set_xattr(self.config_name, "epoch", str(epoch).encode('utf-8'))
         ioctx.close()
 
 
@@ -293,7 +294,8 @@ class CephIscsiConfig():
                 errors_str += '\n    - {}'.format(error)
             raise Exception('ceph-iscsi config not persisted. Check the following errors:{}'.format(errors_str))
         else:
-            self.cluster.write_config(json.dumps(self.config))
+            self.config['epoch'] = self.config['epoch'] + 1
+            self.cluster.write_config(json.dumps(self.config), self.config['epoch'])
 
 
 def _ip_addresses():
@@ -322,7 +324,7 @@ def _get_portal_name(ip):
 
 def _is_acl_enabled(target):
     for tpg in target.tpgs:
-        if tpg.get_attribute('generate_node_acls') == 0:
+        if tpg.get_attribute('generate_node_acls') == '0':
             return True
     return False
 
