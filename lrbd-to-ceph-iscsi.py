@@ -137,7 +137,8 @@ class CephIscsiConfig():
                                       'rbd_*/{}/attrib'.format(backstore_object_name))
         paths = glob.glob(glob_path)
         if not paths:
-            self.errors.append('(Disk attribs not found) - Cannot find attribs at {}'.format(glob_path))
+            self.errors.append('(Disk attribs not found) - Cannot find attribs at '
+                               '{}'.format(glob_path))
         controls_overrides = {}
         for base in paths:
             for attr in self.controls_defaults:
@@ -208,8 +209,8 @@ class CephIscsiConfig():
         target_config = self.config['targets'][target_iqn]
         owner = None
         for portal_name in target_config['portals'].keys():
-            gateways_config = self.config['gateways']
-            if owner is None or gateways_config[portal_name]['active_luns'] < gateways_config[owner]['active_luns']:
+            g_conf = self.config['gateways']
+            if owner is None or g_conf[portal_name]['active_luns'] < g_conf[owner]['active_luns']:
                 owner = portal_name
         return owner
 
@@ -252,8 +253,10 @@ class CephIscsiConfig():
             'group_name': ''
         }
 
-    def add_client_auth(self, target_iqn, client_iqn, userid, password, userid_mutual, password_mutual):
-        self.logger.debug('Adding client lun %s / %s / %s / %s / %s / %s', target_iqn, client_iqn, userid, password, userid_mutual, password_mutual)
+    def add_client_auth(self, target_iqn, client_iqn, userid, password, userid_mutual,
+                        password_mutual):
+        self.logger.debug('Adding client lun %s / %s / %s / %s / %s / %s', target_iqn,
+                          client_iqn, userid, password, userid_mutual, password_mutual)
         client_config = self.config['targets'][target_iqn]['clients'][client_iqn]
         if userid and password:
             client_config['auth']['username'] = userid
@@ -263,7 +266,8 @@ class CephIscsiConfig():
             client_config['auth']['mutual_password'] = password_mutual
 
     def add_client_lun(self, target_iqn, client_iqn, pool, image, lun_id):
-        self.logger.debug('Adding client lun %s / %s / %s / %s / %s', target_iqn, client_iqn, pool, image, lun_id)
+        self.logger.debug('Adding client lun %s / %s / %s / %s / %s', target_iqn, client_iqn,
+                          pool, image, lun_id)
         client_config = self.config['targets'][target_iqn]['clients'][client_iqn]
         disk_id = '{}/{}'.format(pool, image)
         client_config['luns'][disk_id] = {
@@ -271,7 +275,8 @@ class CephIscsiConfig():
         }
 
     def add_discovery_auth(self, userid, password, userid_mutual, password_mutual):
-        self.logger.debug('Adding discovery auth %s / %s / %s / %s', userid, password, userid_mutual, password_mutual)
+        self.logger.debug('Adding discovery auth %s / %s / %s / %s', userid, password,
+                          userid_mutual, password_mutual)
         if userid and password:
             self.config['discovery_auth']['username'] = userid
             self.config['discovery_auth']['password'] = password
@@ -292,7 +297,8 @@ class CephIscsiConfig():
             errors_str = ''
             for error in self.errors:
                 errors_str += '\n    - {}'.format(error)
-            raise Exception('ceph-iscsi config not persisted. Check the following errors:{}'.format(errors_str))
+            raise Exception('ceph-iscsi config not persisted. Check the following errors:'
+                            '{}'.format(errors_str))
         else:
             self.config['epoch'] = self.config['epoch'] + 1
             self.cluster.write_config(json.dumps(self.config), self.config['epoch'])
@@ -329,6 +335,9 @@ def _is_acl_enabled(target):
     return False
 
 def validate(lio_root):
+    """
+    Checks if the existing LIO configuration is supported by ceph-iscsi
+    """
     targets_by_disk = {}
     for target in lio_root.targets:
         for tpg in target.tpgs:
@@ -346,9 +355,10 @@ def validate(lio_root):
                         'Unsupported LIO configuration: Disk {} belongs to more than one '
                         'target ({})'.format(disk_id, targets_by_disk[disk_id]))
 
-def main(logger, pool_name):
-    lio_root = RTSRoot()
-    validate(lio_root)
+def generate_config(lio_root, pool_name, logger):
+    """
+    Reads from LIO and generates the corresponding gateway.conf
+    """
     ceph_iscsi_config = CephIscsiConfig(logger, pool_name)
     discovery_auth_path = '{}/{}/{}'.format('/sys/kernel/config/target',
                                             'iscsi',
@@ -382,11 +392,33 @@ def main(logger, pool_name):
                     password = node_acl.chap_password
                     userid_mutual = node_acl.chap_mutual_userid
                     password_mutual = node_acl.chap_mutual_password
-                    ceph_iscsi_config.add_client_auth(target.wwn, node_acl.node_wwn, userid, password, userid_mutual, password_mutual)
+                    ceph_iscsi_config.add_client_auth(target.wwn, node_acl.node_wwn, userid,
+                                                      password, userid_mutual, password_mutual)
                     for mapped_lun in node_acl.mapped_luns:
                         disk = disks_by_lun[mapped_lun.mapped_lun]
-                        ceph_iscsi_config.add_client_lun(target.wwn, node_acl.node_wwn, disk[0], disk[1], mapped_lun.mapped_lun)
+                        ceph_iscsi_config.add_client_lun(target.wwn, node_acl.node_wwn, disk[0],
+                                                         disk[1], mapped_lun.mapped_lun)
     ceph_iscsi_config.persist_config()
+
+def delete_disabled_acls(lio_root, logger):
+    """
+    Lrbd creates acls on all tpgs, even the disabled ones, but ceph-iscsi
+    will not manage those acls, so we delete all acls from disabled tpgs
+    """
+    for target in lio_root.targets:
+        for tpg in target.tpgs:
+            if not tpg.enable:
+                for node_acl in tpg.node_acls:
+                    logger.info('Deleting %s from disabled tpg %s/%s',
+                                node_acl.node_wwn, target.wwn, tpg)
+                    node_acl.delete()
+
+
+def main(logger, pool_name):
+    lio_root = RTSRoot()
+    validate(lio_root)
+    generate_config(lio_root, pool_name, logger)
+    delete_disabled_acls(lio_root, logger)
 
 
 if __name__ == "__main__":
@@ -400,4 +432,3 @@ if __name__ == "__main__":
         raise Exception('Usage: lrbd-to-ceph-iscsi <pool_name>')
     pool_name = sys.argv[1]
     main(logger, pool_name)
-
