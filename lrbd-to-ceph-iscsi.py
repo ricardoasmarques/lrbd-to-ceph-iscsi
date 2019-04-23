@@ -88,22 +88,25 @@ class CephIscsiConfig():
             config_pretty = self.pprinter.pformat(self.config)
             self.logger.info('Reading config:\n%s', config_pretty)
         except rados.ObjectNotFound:
-            now = CephIscsiConfig._get_time()
-            self.config = {
-                "disks": {},
-                "gateways": {},
-                "targets": {},
-                "discovery_auth": {'username': '',
-                                   'password': '',
-                                   'password_encryption_enabled': False,
-                                   'mutual_username': '',
-                                   'mutual_password': '',
-                                   'mutual_password_encryption_enabled': False},
-                "version": 8,
-                "epoch": 0,
-                "created": now,
-                "updated": now
-            }
+            self.reset_config()
+
+    def reset_config(self):
+        now = CephIscsiConfig._get_time()
+        self.config = {
+            "disks": {},
+            "gateways": {},
+            "targets": {},
+            "discovery_auth": {'username': '',
+                               'password': '',
+                               'password_encryption_enabled': False,
+                               'mutual_username': '',
+                               'mutual_password': '',
+                               'mutual_password_encryption_enabled': False},
+            "version": 8,
+            "epoch": 0,
+            "created": now,
+            "updated": now
+        }
 
     @staticmethod
     def _get_time():
@@ -360,49 +363,55 @@ def generate_config(lio_root, pool_name, logger):
     Reads from LIO and generates the corresponding gateway.conf
     """
     ceph_iscsi_config = CephIscsiConfig(logger, pool_name)
-    discovery_auth_path = '{}/{}/{}'.format('/sys/kernel/config/target',
-                                            'iscsi',
-                                            'discovery_auth')
-    userid = open(discovery_auth_path + "/userid").read().rstrip('\n')
-    userid = '' if userid == 'NULL' else userid
-    password = open(discovery_auth_path + "/password").read().rstrip('\n')
-    password = '' if password == 'NULL' else password
-    userid_mutual = open(discovery_auth_path + "/userid_mutual").read().rstrip('\n')
-    userid_mutual = '' if userid_mutual == 'NULL' else userid_mutual
-    password_mutual = open(discovery_auth_path + "/password_mutual").read().rstrip('\n')
-    password_mutual = '' if password_mutual == 'NULL' else password_mutual
-    ceph_iscsi_config.add_discovery_auth(userid, password, userid_mutual, password_mutual)
-    for target in lio_root.targets:
-        acl_enabled = _is_acl_enabled(target)
-        target_controls = ceph_iscsi_config._get_target_controls(target.wwn)
-        ceph_iscsi_config.add_target(target.wwn, acl_enabled, target_controls)
-        for tpg in target.tpgs:
-            logger.info('Processing tpg - %s', tpg)
-            for network_portal in tpg.network_portals:
-                portal_name = _get_portal_name(network_portal.ip_address)
-                if portal_name:
-                    ceph_iscsi_config.add_portal(target.wwn, portal_name, network_portal.ip_address)
-            if len(list(target.tpgs)) == ceph_iscsi_config.get_tpgs(target.wwn):
-                disks_by_lun = {}
-                for lun in tpg.luns:
-                    udev_path_list = lun.storage_object.udev_path.split('/')
-                    pool = udev_path_list[len(udev_path_list) - 2]
-                    image = udev_path_list[len(udev_path_list) - 1]
-                    disks_by_lun[lun.lun] = (pool, image)
-                    ceph_iscsi_config.add_disk(target.wwn, pool, image, lun.storage_object.wwn)
-                for node_acl in tpg.node_acls:
-                    ceph_iscsi_config.add_client(target.wwn, node_acl.node_wwn)
-                    userid = node_acl.chap_userid
-                    password = node_acl.chap_password
-                    userid_mutual = node_acl.chap_mutual_userid
-                    password_mutual = node_acl.chap_mutual_password
-                    ceph_iscsi_config.add_client_auth(target.wwn, node_acl.node_wwn, userid,
-                                                      password, userid_mutual, password_mutual)
-                    for mapped_lun in node_acl.mapped_luns:
-                        disk = disks_by_lun[mapped_lun.mapped_lun]
-                        ceph_iscsi_config.add_client_lun(target.wwn, node_acl.node_wwn, disk[0],
-                                                         disk[1], mapped_lun.mapped_lun)
-    ceph_iscsi_config.persist_config()
+    try:
+        discovery_auth_path = '{}/{}/{}'.format('/sys/kernel/config/target',
+                                                'iscsi',
+                                                'discovery_auth')
+        userid = open(discovery_auth_path + "/userid").read().rstrip('\n')
+        userid = '' if userid == 'NULL' else userid
+        password = open(discovery_auth_path + "/password").read().rstrip('\n')
+        password = '' if password == 'NULL' else password
+        userid_mutual = open(discovery_auth_path + "/userid_mutual").read().rstrip('\n')
+        userid_mutual = '' if userid_mutual == 'NULL' else userid_mutual
+        password_mutual = open(discovery_auth_path + "/password_mutual").read().rstrip('\n')
+        password_mutual = '' if password_mutual == 'NULL' else password_mutual
+        ceph_iscsi_config.add_discovery_auth(userid, password, userid_mutual, password_mutual)
+        for target in lio_root.targets:
+            acl_enabled = _is_acl_enabled(target)
+            target_controls = ceph_iscsi_config._get_target_controls(target.wwn)
+            ceph_iscsi_config.add_target(target.wwn, acl_enabled, target_controls)
+            for tpg in target.tpgs:
+                logger.info('Processing tpg - %s', tpg)
+                for network_portal in tpg.network_portals:
+                    portal_name = _get_portal_name(network_portal.ip_address)
+                    if portal_name:
+                        ceph_iscsi_config.add_portal(target.wwn, portal_name, network_portal.ip_address)
+                if len(list(target.tpgs)) == ceph_iscsi_config.get_tpgs(target.wwn):
+                    disks_by_lun = {}
+                    for lun in tpg.luns:
+                        udev_path_list = lun.storage_object.udev_path.split('/')
+                        pool = udev_path_list[len(udev_path_list) - 2]
+                        image = udev_path_list[len(udev_path_list) - 1]
+                        disks_by_lun[lun.lun] = (pool, image)
+                        ceph_iscsi_config.add_disk(target.wwn, pool, image, lun.storage_object.wwn)
+                    for node_acl in tpg.node_acls:
+                        ceph_iscsi_config.add_client(target.wwn, node_acl.node_wwn)
+                        userid = node_acl.chap_userid
+                        password = node_acl.chap_password
+                        userid_mutual = node_acl.chap_mutual_userid
+                        password_mutual = node_acl.chap_mutual_password
+                        ceph_iscsi_config.add_client_auth(target.wwn, node_acl.node_wwn, userid,
+                                                          password, userid_mutual, password_mutual)
+                        for mapped_lun in node_acl.mapped_luns:
+                            disk = disks_by_lun[mapped_lun.mapped_lun]
+                            ceph_iscsi_config.add_client_lun(target.wwn, node_acl.node_wwn, disk[0],
+                                                             disk[1], mapped_lun.mapped_lun)
+        ceph_iscsi_config.persist_config()
+    except Exception as e:
+        ceph_iscsi_config.reset_config()
+        ceph_iscsi_config.persist_config()
+        raise e
+
 
 def delete_disabled_acls(lio_root, logger):
     """
