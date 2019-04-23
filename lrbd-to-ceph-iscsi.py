@@ -364,9 +364,13 @@ def generate_config(lio_root, pool_name, logger):
                                             'iscsi',
                                             'discovery_auth')
     userid = open(discovery_auth_path + "/userid").read().rstrip('\n')
+    userid = '' if userid == 'NULL' else userid
     password = open(discovery_auth_path + "/password").read().rstrip('\n')
+    password = '' if password == 'NULL' else password
     userid_mutual = open(discovery_auth_path + "/userid_mutual").read().rstrip('\n')
+    userid_mutual = '' if userid_mutual == 'NULL' else userid_mutual
     password_mutual = open(discovery_auth_path + "/password_mutual").read().rstrip('\n')
+    password_mutual = '' if password_mutual == 'NULL' else password_mutual
     ceph_iscsi_config.add_discovery_auth(userid, password, userid_mutual, password_mutual)
     for target in lio_root.targets:
         acl_enabled = _is_acl_enabled(target)
