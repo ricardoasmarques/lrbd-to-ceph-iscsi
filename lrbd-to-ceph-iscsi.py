@@ -324,10 +324,15 @@ def _ip_addresses():
 
     return list(ip_list)
 
+def _this_host():
+    """
+    return the local machine's shortname
+    """
+    return socket.gethostname().split('.')[0]
 
 def _get_portal_name(ip):
     if ip in _ip_addresses():
-        return socket.gethostname().split('.')[0]
+        return _this_host()
     return None
 
 
@@ -363,6 +368,8 @@ def generate_config(lio_root, pool_name, logger):
     Reads from LIO and generates the corresponding gateway.conf
     """
     ceph_iscsi_config = CephIscsiConfig(logger, pool_name)
+    if _this_host() in ceph_iscsi_config.config['gateways']:
+        return
     try:
         discovery_auth_path = '{}/{}/{}'.format('/sys/kernel/config/target',
                                                 'iscsi',
