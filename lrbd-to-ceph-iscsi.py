@@ -102,7 +102,7 @@ class CephIscsiConfig():
                                'mutual_username': '',
                                'mutual_password': '',
                                'mutual_password_encryption_enabled': False},
-            "version": 8,
+            "version": 9,
             "epoch": 0,
             "created": now,
             "updated": now
@@ -196,15 +196,21 @@ class CephIscsiConfig():
                 'created': now,
                 'gateway_ip_list': [],
                 'inactive_portal_ips': [],
-                'portal_ip_address': ip,
+                'portal_ip_addresses': [ip],
                 'tpgs': 0
             }
+        else:
+            portal_config = target_config['portals'][portal_name]
+            if ip not in portal_config['portal_ip_addresses']:
+                portal_config['portal_ip_addresses'].append(ip)
+
         if ip not in target_config['ip_list']:
             target_config['ip_list'].append(ip)
         for _, portal_config in target_config['portals'].items():
             portal_config['gateway_ip_list'] = target_config['ip_list']
             inactive_portal_ips = list(portal_config['gateway_ip_list'])
-            inactive_portal_ips.remove(portal_config['portal_ip_address'])
+            for portal_ip_address in portal_config['portal_ip_addresses']:
+                inactive_portal_ips.remove(portal_ip_address)
             portal_config['inactive_portal_ips'] = inactive_portal_ips
             portal_config['tpgs'] = len(target_config['ip_list'])
 
